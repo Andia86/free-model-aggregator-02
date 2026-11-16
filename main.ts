@@ -1,35 +1,24 @@
-// The best free AI model aggregator: a routing server.
+// The free-model aggregator: one server, two client APIs, every free model
+// the trial brief names.
 //
-// What it does, in one paragraph: the trial brief names ten providers of free models, a sealed
-// quality table rating every model, and a workload of twenty requests. This server registers a
-// catalog built from that brief, then answers each client request — OpenAI-shaped or
-// Anthropic-shaped, streamed or not — from the best free model that can carry it, on whichever
-// provider wire that model lives, translating the request and the answer across wires when the
-// two differ. A provider that refuses (its per-trial budget spent, a scheduled failure, an
-// outage) is set aside for that request and the next-best model answers instead. Rating always
-// leads the order: a refusal only costs a provider its place against candidates rated within
-// 15 milli of it, where one that has not refused goes first, and the refusal is forgotten once
-// two further requests have been handled (or at once, when the provider answers again). Equally
-// rated candidates are taken from the provider called least so far this trial, so one model
-// offered by several providers draws on all their budgets rather than draining the first. One
-// request gives up after six refused calls rather than walk the whole directory.
+// The server serves the OpenAI Chat Completions API and the Anthropic
+// Messages API, in JSON and in server-sent events, over the providers the
+// brief lists. For each request it plans from the brief's sealed quality
+// table: the candidates are the free models that meet the request's
+// requirements, best rating first; a provider that refuses hands the
+// request to the next candidate. At the trial's start it registers its
+// port and catalog with the env, and it exits 0 when the env's /work says
+// the workload is done.
 //
-// The rules it lives by, because the scoring does:
-//   - an answer only counts from a free model that meets the request's requirements, so paid
-//     models are never candidates and capability checks come from the brief's own table;
-//   - exactly one provider call may succeed per request, so a successful answer is always the
-//     one served, never shopped around;
-//   - the usage, stop reason and echoed request fields of an answer must be the provider's own,
-//     so same-wire traffic passes through untouched and cross-wire traffic is translated
-//     field-by-field (lib/wire.ts) rather than re-answered;
-//   - every choice derives from the brief, the request and the providers' answers — no clock,
-//     no randomness — so a replayed trial makes the same calls and leaves the same state.
+//   node main.ts --list   print the catalog document and exit
+//   node main.ts          serve a trial
 //
-// Layout: lib/brief.ts reads the brief and builds the catalog; lib/wire.ts holds the wire
-// translations; this file is the server, the planner and the trial lifecycle (listen, register,
-// poll /work, exit 0 when the work is done).
+// Everything the server chooses derives from the brief, the requests and
+// the providers' answers — never from the wall clock or from randomness —
+// so a replayed trial makes the same choices and leaves the same export.
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readFileSync } from 'node:fs';
 import {
   buildCatalog,
@@ -37,292 +26,274 @@ import {
   isRecord,
   meetsRequirements,
   parseBrief,
-  type Brief,
-  type ClientApi,
-  type Json,
-  type ProviderDoc,
-  type RatingRow,
-  type Requires,
 } from './lib/brief.ts';
+import type { Brief, ClientApi, Json, ProviderDoc, RatingRow, Requires } from './lib/brief.ts';
 import {
-  anthropicModelList,
-  clientError,
-  fromAnthropic,
-  fromOpenAI,
-  openAIModelList,
+  anthropicError,
+  buildProviderRequest,
+  openAIError,
+  parseAnthropicRequest,
+  parseOpenAIRequest,
   parseProviderAnswer,
-  renderClientAnswer,
-  toAnthropic,
-  toGemini,
-  toOpenAI,
-  type NormalizedRequest,
+  providerHeaders,
+  providerPath,
+  renderAnthropicJson,
+  renderAnthropicSse,
+  renderOpenAIJson,
+  renderOpenAISse,
 } from './lib/wire.ts';
+import type { NormalizedAnswer, NormalizedRequest } from './lib/wire.ts';
 
-/** How long to wait on one provider call before treating it as refused. */
-const CALL_TIMEOUT_MS = 25_000;
-/** The /work poll interval. */
-const POLL_MS = 100;
-/** Leave the trial before its wall does: a server stopped at the wall scores nothing. */
-const WALL_GUARD_MS = 160_000;
-/** Ratings this close (in milli) count as a near-tie, the only place taint is allowed a say. */
-const NEAR_TIE_MILLI = 15;
-/** How many later requests a refusal is remembered for before the taint expires on its own. */
+const MAX_FAILURES_PER_REQUEST = 6;
+const TAINT_FRESH_MILLI = 45;
+const TAINT_OLD_MILLI = 15;
 const TAINT_REQUESTS = 2;
-/** Refused calls one request may spend before it stops trying and answers 502. */
-const MAX_FAILED_ATTEMPTS = 6;
 
-/** One provider at runtime: its directory entry, the key to call it with, its recent luck. */
-interface RuntimeProvider {
-  doc: ProviderDoc;
-  /** Directory order, the final tie-break between equal candidates. */
-  index: number;
-  key: string;
-  /**
-   * Refusals since the provider's last success; a success clears the count. The count outlives
-   * an expired taint, so a provider that keeps refusing sorts behind one that refused once.
-   */
-  refusals: number;
-  /**
-   * Whether the provider refused recently: since its last success, and within the last
-   * TAINT_REQUESTS requests. Taint never outranks rating — it only breaks near-ties: between
-   * candidates rated within NEAR_TIE_MILLI of each other the untainted one goes first, and
-   * between tainted ones the one with fewer refusals. A refusal may be a single scheduled
-   * point, so the taint clears on a success or once TAINT_REQUESTS further requests have been
-   * handled, whichever comes first.
-   */
-  tainted: boolean;
-  /** The request (by requestSeq) during which the provider last refused; dates the taint. */
-  refusedAt: number;
-  /** Calls made to the provider so far this trial, answered or refused. */
-  attempts: number;
-}
-
-interface Candidate {
-  provider: RuntimeProvider;
-  row: RatingRow;
-}
-
-let brief: Brief = { providers: [], ratings: [], manifest: [] };
-let catalog: Json = { providers: [] };
-let modelIds: string[] = [];
-let envUrl = '';
-const runtime = new Map<string, RuntimeProvider>();
-/** Chat-shaped posts seen so far: the manifest row a request answers to, by arrival order. */
-let requestSeq = 0;
-
-/** A row's rating in milli, the primary key of every ordering below. */
-function ratingOf(row: RatingRow): number {
-  return row.rating_milli;
-}
-
-/** Rating first; equal ratings go to the provider called least so far, then directory order. */
-function byRating(a: Candidate, b: Candidate): number {
-  const ratingA = ratingOf(a.row);
-  const ratingB = ratingOf(b.row);
-  if (ratingA !== ratingB) return ratingB - ratingA;
-  if (a.provider.attempts !== b.provider.attempts) return a.provider.attempts - b.provider.attempts;
-  return a.provider.index - b.provider.index;
-}
-
-/** The order among near-tied candidates: untainted first, then fewer refusals, then rating. */
-function byNearTie(a: Candidate, b: Candidate): number {
-  const taintA = a.provider.tainted ? 1 : 0;
-  const taintB = b.provider.tainted ? 1 : 0;
-  if (taintA !== taintB) return taintA - taintB;
-  if (taintA === 1 && a.provider.refusals !== b.provider.refusals) return a.provider.refusals - b.provider.refusals;
-  return byRating(a, b);
-}
-
-/** Forget refusals that TAINT_REQUESTS later requests have already been handled since. */
-function expireTaint(seq: number): void {
-  for (const provider of runtime.values()) {
-    if (provider.tainted && seq - provider.refusedAt > TAINT_REQUESTS) provider.tainted = false;
+function loadBrief(): Brief {
+  const file = process.env.MAKEFUN_PROMPT_FILE;
+  if (file === undefined || file === '') return { providers: [], ratings: [], manifest: [] };
+  try {
+    return parseBrief(readFileSync(file, 'utf8'));
+  } catch {
+    return { providers: [], ratings: [], manifest: [] };
   }
+}
+
+const brief = loadBrief();
+const catalog = buildCatalog(brief);
+const catalogText = JSON.stringify(catalog);
+const envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
+
+const providerById = new Map<string, ProviderDoc>();
+for (const provider of brief.providers) providerById.set(provider.id, provider);
+
+// Routing state, all a function of the requests served so far: how many
+// calls each provider has taken, and at which request it last refused.
+const callsMade = new Map<string, number>();
+const lastRefusalAt = new Map<string, number>();
+let requestsServed = 0;
+
+/**
+ * The taint a provider carries into a request, in milli of rating. A
+ * refusal on the immediately preceding request is fresh evidence the
+ * provider is spent or out, and costs it heavily; a refusal two requests
+ * back may have been one scheduled blip, and costs it only a little. The
+ * taint is forgotten once two further requests have been handled, or at
+ * once when the provider answers again.
+ */
+function taintPenalty(providerId: string, requestIndex: number): number {
+  const at = lastRefusalAt.get(providerId);
+  if (at === undefined) return 0;
+  const age = requestIndex - at;
+  if (age <= 1) return TAINT_FRESH_MILLI;
+  if (age <= TAINT_REQUESTS) return TAINT_OLD_MILLI;
+  return 0;
 }
 
 /**
- * The candidates for one request, best first: each provider's best free model that meets the
- * requirements. A request the client put in JSON mode can only ride a wire that can echo JSON
- * mode back (OpenAI's response_format, Gemini's responseMimeType) — the Anthropic wire has no
- * such flag, so its providers sit these requests out. The order is by rating, with equal
- * ratings spread toward the provider called least so far. Taint only reorders near-ties: each
- * place is filled from the candidates within NEAR_TIE_MILLI of the best one left, untainted
- * before tainted and fewer refusals before more, so no candidate is ever passed over for one
- * rated more than NEAR_TIE_MILLI below it. Tainted providers stay in the list: a scheduled
- * failure is a single point, and a later place is still better than no answer.
+ * The candidates for one request, best first. Only free models that meet
+ * the request's requirements qualify. A request the client put in JSON
+ * mode must ride a wire that can echo JSON mode back, so Anthropic-wire
+ * providers sit those out: their wire has no such flag to echo.
+ *
+ * Order is rating first, docked by each provider's taint (see
+ * taintPenalty): a fresh refusal costs a provider its place against
+ * every candidate rated within 45 milli of it, an older one only within
+ * 15, so a run of refusals cannot spend a request's whole retry budget
+ * re-asking providers that just said no while a sound mid-table provider
+ * waits below them. Equally placed candidates go to the provider called
+ * least so far, then by provider and model id, so the order is fully
+ * determined by the brief and the trial so far.
  */
-function candidates(requires: Requires, jsonModeCarry: boolean): Candidate[] {
-  const bestByProvider = new Map<string, RatingRow>();
-  for (const row of brief.ratings) {
-    if (!row.free) continue;
-    if (!meetsRequirements(row, requires)) continue;
-    const provider = runtime.get(row.provider);
-    if (provider === undefined) continue;
-    if (jsonModeCarry && provider.doc.wire === 'anthropic') continue;
-    const current = bestByProvider.get(row.provider);
-    if (current === undefined || ratingOf(row) > ratingOf(current)) bestByProvider.set(row.provider, row);
+function planCandidates(requires: Requires, jsonMode: boolean, requestIndex: number): RatingRow[] {
+  let rows = brief.ratings.filter((row) => row.free && meetsRequirements(row, requires));
+  if (jsonMode) {
+    rows = rows.filter((row) => providerById.get(row.provider)?.wire !== 'anthropic');
   }
-  let pool: Candidate[] = [...bestByProvider.values()].map((row) => ({ provider: runtime.get(row.provider) as RuntimeProvider, row }));
-  pool.sort(byRating);
-  const ordered: Candidate[] = [];
-  for (let head = pool[0]; head !== undefined; head = pool[0]) {
-    const floor = ratingOf(head.row) - NEAR_TIE_MILLI;
-    let pick = head;
-    for (const other of pool) {
-      if (ratingOf(other.row) < floor) break;
-      if (byNearTie(other, pick) < 0) pick = other;
-    }
-    const chosen = pick;
-    ordered.push(chosen);
-    pool = pool.filter((candidate) => candidate !== chosen);
+  if (rows.length === 0) {
+    // Nothing legal can serve this request as specified; still answer
+    // with the best free model available rather than not answering.
+    rows = brief.ratings.filter((row) => row.free);
   }
-  return ordered;
-}
-
-/** Requirements read off a body the manifest has no row for (a request past the manifest). */
-function inferRequires(api: ClientApi, body: Json): Requires {
-  const requires: Requires = {};
-  if (Array.isArray(body.tools) && body.tools.length > 0) requires.tools = true;
-  if (api === 'openai' && isRecord(body.response_format)) requires.json = true;
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  for (const message of messages) {
-    if (!isRecord(message) || !Array.isArray(message.content)) continue;
-    for (const block of message.content) {
-      if (isRecord(block) && (block.type === 'image_url' || block.type === 'image')) requires.vision = true;
-    }
-  }
-  return requires;
-}
-
-/** The client's body with the routed model named, and a streamed usage chunk asked for. */
-function passthroughBody(api: ClientApi, body: Json, model: string): Json {
-  const out: Json = { ...body, model };
-  if (api === 'openai' && body.stream === true) {
-    const options = isRecord(body.stream_options) ? body.stream_options : {};
-    out.stream_options = { ...options, include_usage: true };
-  }
-  return out;
-}
-
-interface ProviderReply {
-  status: number;
-  contentType: string;
-  bodyText: string;
-}
-
-/** One call to one provider on its own wire, translated if the client's wire differs. */
-async function callProvider(
-  candidate: Candidate,
-  api: ClientApi,
-  body: Json,
-  normalized: () => NormalizedRequest,
-): Promise<ProviderReply | null> {
-  const { doc } = candidate.provider;
-  const model = candidate.row.model;
-  let url: string;
-  let payload: Json;
-  if (doc.wire === 'openai') {
-    url = `${envUrl}${doc.path}/v1/chat/completions`;
-    payload = api === 'openai' ? passthroughBody(api, body, model) : toOpenAI(normalized(), model);
-  } else if (doc.wire === 'anthropic') {
-    url = `${envUrl}${doc.path}/v1/messages`;
-    payload = api === 'anthropic' ? passthroughBody(api, body, model) : toAnthropic(normalized(), model);
-  } else {
-    const gemini = toGemini(normalized(), model);
-    url = `${envUrl}${doc.path}${gemini.path}`;
-    payload = gemini.body;
-  }
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
-  if (doc.auth === 'bearer') headers.authorization = `Bearer ${candidate.provider.key}`;
-  else if (doc.auth === 'x-api-key') headers['x-api-key'] = candidate.provider.key;
-  else if (doc.auth === 'x-goog-api-key') headers['x-goog-api-key'] = candidate.provider.key;
-  if (doc.wire === 'anthropic') headers['anthropic-version'] = '2023-06-01';
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(CALL_TIMEOUT_MS),
-    });
+  const placed = rows.map((row) => {
+    const penalty = taintPenalty(row.provider, requestIndex);
     return {
-      status: response.status,
-      contentType: response.headers.get('content-type') ?? 'application/json',
-      bodyText: await response.text(),
+      row,
+      tainted: penalty > 0,
+      score: row.rating_milli - penalty,
+      calls: callsMade.get(row.provider) ?? 0,
     };
-  } catch {
-    return null;
-  }
+  });
+  placed.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (a.tainted !== b.tainted) return a.tainted ? 1 : -1;
+    if (a.calls !== b.calls) return a.calls - b.calls;
+    if (a.row.provider !== b.row.provider) return a.row.provider < b.row.provider ? -1 : 1;
+    if (a.row.model !== b.row.model) return a.row.model < b.row.model ? -1 : 1;
+    return 0;
+  });
+  return placed.map((entry) => entry.row);
 }
 
-function send(res: ServerResponse, status: number, contentType: string, body: string): void {
-  res.writeHead(status, { 'content-type': contentType });
-  res.end(body);
+/** The key a provider is dialed with: the brief's own, else the secret it names. */
+function providerKey(provider: ProviderDoc): string {
+  if (provider.key !== '') return provider.key;
+  if (provider.key_env !== '') return process.env[provider.key_env] ?? '';
+  return '';
+}
+
+/** The absolute URL of a provider: its path joined to the env, never to a client. */
+function providerBase(provider: ProviderDoc): string {
+  if (/^https?:\/\//.test(provider.path)) return provider.path.replace(/\/+$/, '');
+  return envUrl + provider.path;
+}
+
+type CallOutcome =
+  | { ok: true; answer: NormalizedAnswer }
+  | { ok: false };
+
+/**
+ * One call to one provider with one model. Same-wire traffic passes the
+ * client's body through untouched apart from the model and the stream
+ * flag — providers are always dialed non-streaming, and the client's
+ * stream is rendered here from the whole answer — so nothing the client
+ * sent is rewritten or dropped. Cross-wire traffic goes through the
+ * normalized form in lib/wire.ts.
+ */
+async function callProvider(
+  provider: ProviderDoc,
+  model: string,
+  clientApi: ClientApi,
+  rawBody: Json,
+  norm: NormalizedRequest,
+): Promise<CallOutcome> {
+  const dial = { wire: provider.wire, auth: provider.auth, key: providerKey(provider) };
+  const body: Json =
+    provider.wire === clientApi
+      ? { ...rawBody, model, stream: false }
+      : buildProviderRequest(provider.wire, norm, model);
+  const url = providerBase(provider) + providerPath(provider.wire, model);
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      method: 'POST',
+      headers: providerHeaders(dial),
+      body: JSON.stringify(body),
+    });
+  } catch {
+    return { ok: false };
+  }
+  if (!response.ok) {
+    try {
+      await response.text();
+    } catch {
+      // The refusal is already counted; its body carries nothing we need.
+    }
+    return { ok: false };
+  }
+  try {
+    const value: unknown = await response.json();
+    if (!isRecord(value)) return { ok: false };
+    return { ok: true, answer: parseProviderAnswer(provider.wire, value) };
+  } catch {
+    return { ok: false };
+  }
 }
 
 /**
- * One client request: try the candidates in order until one answers, then serve its answer.
- * After MAX_FAILED_ATTEMPTS refused calls the request stops trying and answers 502.
+ * What the request at this index needs. The client sends the workload in
+ * manifest order, one request at a time, so the manifest row at the
+ * request's own index is authoritative. Past the manifest's end — or with
+ * no manifest at all — the requirements are read off the request itself.
  */
-async function handleChat(api: ClientApi, raw: string, res: ServerResponse): Promise<void> {
-  const seq = requestSeq;
-  requestSeq += 1;
-  let body: Json;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (!isRecord(parsed)) throw new Error('not an object');
-    body = parsed;
-  } catch {
-    send(res, 400, 'application/json', JSON.stringify(clientError(api, 'the request body is not one JSON object')));
-    return;
-  }
-  const row = seq < brief.manifest.length ? brief.manifest[seq] : undefined;
-  const stream = body.stream === true || (row !== undefined && row.stream);
-  const requires = row !== undefined ? row.requires : inferRequires(api, body);
-  const format = isRecord(body.response_format) ? body.response_format.type : undefined;
-  const jsonModeCarry = api === 'openai' && (format === 'json_object' || format === 'json_schema');
-  let normalizedCache: NormalizedRequest | null = null;
-  const normalized = (): NormalizedRequest => {
-    if (normalizedCache === null) normalizedCache = api === 'openai' ? fromOpenAI(body) : fromAnthropic(body);
-    return normalizedCache;
-  };
-
-  expireTaint(seq);
-  let failures = 0;
-  for (const candidate of candidates(requires, jsonModeCarry)) {
-    candidate.provider.attempts += 1;
-    const reply = await callProvider(candidate, api, body, normalized);
-    if (reply === null || reply.status < 200 || reply.status >= 300) {
-      candidate.provider.refusals += 1;
-      candidate.provider.tainted = true;
-      candidate.provider.refusedAt = Math.max(candidate.provider.refusedAt, seq);
-      failures += 1;
-      if (failures >= MAX_FAILED_ATTEMPTS) break;
-      continue;
-    }
-    candidate.provider.refusals = 0;
-    candidate.provider.tainted = false;
-    if (candidate.provider.doc.wire === api) {
-      send(res, reply.status, reply.contentType, reply.bodyText);
-      return;
-    }
-    const answer = parseProviderAnswer(candidate.provider.doc.wire, stream, reply.bodyText);
-    if (answer === null) {
-      const rendered = renderClientAnswer(api, stream, candidate.row.model, { text: '', inputTokens: 0, outputTokens: 0 });
-      send(res, 200, rendered.contentType, rendered.body);
-      return;
-    }
-    const rendered = renderClientAnswer(api, stream, candidate.row.model, answer);
-    send(res, 200, rendered.contentType, rendered.body);
-    return;
-  }
-  send(res, 502, 'application/json', JSON.stringify(clientError(api, 'every provider refused this request')));
+function manifestRequires(index: number, norm: NormalizedRequest): Requires {
+  const row = brief.manifest[index];
+  if (row !== undefined) return row.requires;
+  const derived: Requires = {};
+  if (norm.tools.length > 0) derived.tools = true;
+  if (norm.turns.some((turn) => turn.images.length > 0)) derived.vision = true;
+  if (norm.jsonMode) derived.json = true;
+  return derived;
 }
 
-/** GET /v1/models, in the shape the caller's auth header asks for. */
-function handleModels(req: IncomingMessage, res: ServerResponse): void {
-  const anthropic = req.headers['x-api-key'] !== undefined;
-  const list = anthropic ? anthropicModelList(modelIds) : openAIModelList(modelIds);
-  send(res, 200, 'application/json', JSON.stringify(list));
+/** Serve one client request: plan, dial with failover, render the answer. */
+async function serveRequest(
+  clientApi: ClientApi,
+  rawBody: Json,
+): Promise<{ status: number; contentType: string; body: string }> {
+  const index = requestsServed;
+  const norm = clientApi === 'openai' ? parseOpenAIRequest(rawBody) : parseAnthropicRequest(rawBody);
+  const requires = manifestRequires(index, norm);
+  const candidates = planCandidates(requires, norm.jsonMode, index);
+  let failures = 0;
+  let answer: NormalizedAnswer | null = null;
+  let servedModel = '';
+  for (const candidate of candidates) {
+    if (failures >= MAX_FAILURES_PER_REQUEST) break;
+    const provider = providerById.get(candidate.provider);
+    if (provider === undefined) continue;
+    callsMade.set(provider.id, (callsMade.get(provider.id) ?? 0) + 1);
+    const outcome = await callProvider(provider, candidate.model, clientApi, rawBody, norm);
+    if (outcome.ok) {
+      lastRefusalAt.delete(provider.id);
+      answer = outcome.answer;
+      servedModel = candidate.model;
+      break;
+    }
+    failures += 1;
+    lastRefusalAt.set(provider.id, index);
+  }
+  requestsServed += 1;
+  if (answer === null) {
+    const message = 'no free provider could serve this request';
+    const error = clientApi === 'openai' ? openAIError(message) : anthropicError(message);
+    return { status: 502, contentType: 'application/json', body: JSON.stringify(error) };
+  }
+  if (norm.stream) {
+    const sse = clientApi === 'openai' ? renderOpenAISse(answer, servedModel) : renderAnthropicSse(answer, servedModel);
+    return { status: 200, contentType: 'text/event-stream; charset=utf-8', body: sse };
+  }
+  const json = clientApi === 'openai' ? renderOpenAIJson(answer, servedModel) : renderAnthropicJson(answer, servedModel);
+  return { status: 200, contentType: 'application/json', body: JSON.stringify(json) };
+}
+
+/** The free model ids of the catalog, each once, in catalog order. */
+function listedModelIds(): string[] {
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const id of freeModelIds(catalog)) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
+/**
+ * GET /v1/models, in the wire the caller's auth header names: an
+ * `Authorization: Bearer` request gets the OpenAI model list, an
+ * `x-api-key` request the Anthropic one. Both list exactly the free
+ * model ids the catalog registers.
+ */
+function modelsReply(req: IncomingMessage): { status: number; contentType: string; body: string } {
+  const ids = listedModelIds();
+  if (req.headers['x-api-key'] !== undefined) {
+    const body = {
+      data: ids.map((id) => ({
+        type: 'model',
+        id,
+        display_name: id,
+        created_at: '2026-01-01T00:00:00Z',
+      })),
+      has_more: false,
+    };
+    return { status: 200, contentType: 'application/json', body: JSON.stringify(body) };
+  }
+  const body = {
+    object: 'list',
+    data: ids.map((id) => ({ id, object: 'model', created: 1767225600, owned_by: 'aggregator' })),
+  };
+  return { status: 200, contentType: 'application/json', body: JSON.stringify(body) };
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -331,106 +302,118 @@ function readBody(req: IncomingMessage): Promise<string> {
     let size = 0;
     req.on('data', (chunk: Buffer) => {
       size += chunk.length;
-      if (size <= 2 * 1024 * 1024) chunks.push(chunk);
+      if (size <= 4 * 1024 * 1024) chunks.push(chunk);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
 
-async function main(): Promise<void> {
-  const promptFile = process.env.MAKEFUN_PROMPT_FILE;
-  if (promptFile !== undefined && promptFile !== '') {
-    try {
-      brief = parseBrief(readFileSync(promptFile, 'utf8'));
-    } catch {
-      brief = { providers: [], ratings: [], manifest: [] };
-    }
-  }
-  catalog = buildCatalog(brief);
-  modelIds = freeModelIds(catalog);
+function send(res: ServerResponse, reply: { status: number; contentType: string; body: string }): void {
+  res.writeHead(reply.status, {
+    'content-type': reply.contentType,
+    'content-length': String(Buffer.byteLength(reply.body)),
+  });
+  res.end(reply.body);
+}
 
-  if (process.argv.includes('--list')) {
-    process.stdout.write(`${JSON.stringify(catalog)}\n`);
+async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const path = (req.url ?? '').split('?')[0];
+  if (req.method === 'GET' && path === '/v1/models') {
+    send(res, modelsReply(req));
     return;
   }
-
-  envUrl = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-  if (envUrl === '') return;
-
-  brief.providers.forEach((doc, index) => {
-    const key = doc.key !== '' ? doc.key : (process.env[doc.key_env] ?? '');
-    runtime.set(doc.id, { doc, index, key, refusals: 0, tainted: false, refusedAt: 0, attempts: 0 });
-  });
-
-  const server = createServer((req, res) => {
-    const path = (req.url ?? '').split('?')[0];
-    if (req.method === 'GET' && path === '/v1/models') {
-      handleModels(req, res);
+  if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/messages')) {
+    const clientApi: ClientApi = path === '/v1/messages' ? 'anthropic' : 'openai';
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(await readBody(req));
+    } catch {
+      parsed = null;
+    }
+    if (!isRecord(parsed)) {
+      const error = clientApi === 'openai'
+        ? openAIError('the request body is not one JSON object', 'invalid_request')
+        : anthropicError('the request body is not one JSON object');
+      send(res, { status: 400, contentType: 'application/json', body: JSON.stringify(error) });
       return;
     }
-    if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/messages')) {
-      const api: ClientApi = path === '/v1/messages' ? 'anthropic' : 'openai';
-      readBody(req)
-        .then((raw) => handleChat(api, raw, res))
-        .catch(() => send(res, 400, 'application/json', JSON.stringify(clientError(api, 'the request could not be read'))));
-      return;
-    }
-    send(res, 404, 'application/json', JSON.stringify(clientError('openai', `no route ${req.method ?? ''} ${path}`)));
+    send(res, await serveRequest(clientApi, parsed));
+    return;
+  }
+  send(res, {
+    status: 404,
+    contentType: 'application/json',
+    body: JSON.stringify(openAIError(`no route ${req.method ?? ''} ${path}`, 'not_found')),
   });
+}
 
-  await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve));
-  const address = server.address();
-  const port = typeof address === 'object' && address !== null ? address.port : 0;
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-  let finished = false;
-  const finish = (): void => {
-    if (finished) return;
-    finished = true;
-    server.close();
-    process.exit(0);
-  };
-  process.on('SIGTERM', finish);
-  process.on('SIGINT', finish);
-  setTimeout(finish, WALL_GUARD_MS);
-
-  const registerBody = JSON.stringify({ protocol_version: 1, port, catalog });
-  /** One /register attempt; true once the environment has accepted the catalog. */
-  const register = async (): Promise<boolean> => {
+/** Register this server's port and catalog with the env, retrying briefly. */
+async function register(port: number): Promise<void> {
+  const body = JSON.stringify({ protocol_version: 1, port, catalog });
+  for (let attempt = 0; attempt < 10; attempt += 1) {
     try {
       const response = await fetch(`${envUrl}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: registerBody,
-        signal: AbortSignal.timeout(10_000),
+        body,
       });
       await response.text();
-      return response.ok;
+      if (response.ok) return;
     } catch {
-      return false;
+      // The env may still be coming up; the next attempt decides.
     }
-  };
-  let registered = false;
-  for (let attempt = 0; attempt < 3 && !registered; attempt += 1) {
-    registered = await register();
+    await sleep(300);
   }
+}
 
-  const poll = async (): Promise<void> => {
-    while (!finished) {
-      if (!registered) registered = await register();
-      try {
-        const response = await fetch(`${envUrl}/work`, { signal: AbortSignal.timeout(10_000) });
-        const work: unknown = await response.json();
-        if (isRecord(work) && work.done === true) {
-          finish();
-          return;
-        }
-      } catch {
+/** Poll the env's /work until it says the workload is done, then exit 0. */
+async function pollWorkUntilDone(): Promise<void> {
+  for (;;) {
+    try {
+      const response = await fetch(`${envUrl}/work`);
+      if (response.ok) {
+        const value: unknown = await response.json();
+        if (isRecord(value) && value.done === true) return;
       }
-      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+    } catch {
+      // A failed poll says nothing about the workload; poll again.
     }
-  };
-  void poll();
+    await sleep(200);
+  }
+}
+
+async function main(): Promise<void> {
+  if (process.argv.includes('--list')) {
+    process.stdout.write(`${catalogText}\n`);
+    return;
+  }
+  const server = createServer((req, res) => {
+    void handle(req, res).catch(() => {
+      try {
+        send(res, {
+          status: 500,
+          contentType: 'application/json',
+          body: JSON.stringify(openAIError('internal error', 'internal')),
+        });
+      } catch {
+        // The client is gone; there is nothing left to answer.
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '0.0.0.0', resolve));
+  const address = server.address();
+  const port = address !== null && typeof address === 'object' ? address.port : 0;
+  if (envUrl !== '') {
+    await register(port);
+    await pollWorkUntilDone();
+    server.close();
+    process.exit(0);
+  }
 }
 
 void main();
